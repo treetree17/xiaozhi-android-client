@@ -8,6 +8,7 @@ import 'package:ai_assistant/providers/conversation_provider.dart';
 import 'package:ai_assistant/services/xiaozhi_service.dart';
 import 'dart:async';
 import 'dart:io';
+import 'package:ai_assistant/utils/vad_auto_wake.dart';
 
 class VoiceCallScreen extends StatefulWidget {
   final Conversation conversation;
@@ -33,6 +34,9 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
   Duration _callDuration = Duration.zero;
   bool _serverReady = false;
 
+  late VadAutoWake _vadAutoWake;
+  bool _vadEnabled = true;
+
   late AnimationController _animationController;
   final List<double> _audioLevels = List.filled(30, 0.05);
   Timer? _audioVisualizerTimer;
@@ -41,7 +45,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
   void initState() {
     super.initState();
 
-    // 设置状态栏为透明并使图标为白色
     SystemChrome.setSystemUIOverlayStyle(
       const SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
@@ -53,7 +56,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
       ),
     );
 
-    // 在帧绘制后再次设置系统UI样式，避免被覆盖
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SystemChrome.setSystemUIOverlayStyle(
         const SystemUiOverlayStyle(
@@ -72,7 +74,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
       duration: const Duration(milliseconds: 1000),
     )..repeat(reverse: true);
 
-    // 获取XiaozhiService实例
     _xiaozhiService = XiaozhiService(
       websocketUrl: widget.xiaozhiConfig.websocketUrl,
       macAddress: widget.xiaozhiConfig.macAddress,
@@ -80,26 +81,35 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
       sessionId: widget.conversation.id,
     );
 
-    // 设置消息监听器
     _xiaozhiService.setMessageListener(_handleServerMessage);
 
-    // 连接并切换到语音通话模式
     _connectToVoiceService();
     _startAudioVisualizer();
+
+    // 初始化 VAD 自动唤醒
+    _vadAutoWake = VadAutoWake();
+    _vadAutoWake.onSpeechStart = () {
+      if (_isConnected && !_isSpeaking) {
+        print('VAD: 检测到语音，自动开始录音');
+        _startSpeaking();
+      }
+    };
+    _vadAutoWake.onSpeechEnd = () {
+      print('VAD: 语音结束');
+    };
+    _vadAutoWake.onError = (error) {
+      print('VAD 错误: $error');
+    };
   }
 
   void _handleServerMessage(dynamic message) {
-    // 处理服务器发来的消息
     if (message is Map<String, dynamic> && message['type'] == 'hello') {
       print('收到服务器hello消息: $message');
       setState(() {
         _serverReady = true;
       });
 
-      // 服务器准备好后延迟短暂时间再自动开始录音
-      // 这样可以确保会话ID已经被正确设置
       if (_isConnected && !_isSpeaking) {
-        // 延迟1秒，确保服务端和客户端都已准备就绪
         Future.delayed(const Duration(milliseconds: 1000), () {
           if (mounted && _isConnected && !_isSpeaking) {
             print('准备开始录音...');
@@ -112,13 +122,13 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
 
   @override
   void dispose() {
-    // 切换回普通聊天模式
+    _vadAutoWake.dispose();
+
     _xiaozhiService.switchToChatMode();
     _callTimer?.cancel();
     _audioVisualizerTimer?.cancel();
     _animationController.dispose();
 
-    // 确保停止所有音频播放
     _xiaozhiService.stopPlayback();
 
     super.dispose();
@@ -130,7 +140,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
     });
 
     try {
-      // 切换到语音通话模式
       await _xiaozhiService.switchToVoiceCallMode();
 
       setState(() {
@@ -138,7 +147,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
         _isConnected = true;
       });
 
-      // 显示连接成功的提示
       if (mounted) {
         _showCustomSnackbar(
           message: '已进入语音通话模式',
@@ -149,14 +157,19 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
 
       _startCallTimer();
 
-      // 添加会话消息
+      // 启动 VAD 自动唤醒
+      if (_vadEnabled) {
+        _vadAutoWake.start().catchError((e) {
+          print('启动 VAD 失败: $e');
+        });
+      }
+
       Provider.of<ConversationProvider>(context, listen: false).addMessage(
         conversationId: widget.conversation.id,
         role: MessageRole.assistant,
         content: '语音通话已开始',
       );
 
-      // 直接开始录音
       _startSpeaking();
     } catch (e) {
       setState(() {
@@ -189,7 +202,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
     ) {
       if (_isConnected) {
         setState(() {
-          // Simulate audio levels
           for (int i = 0; i < _audioLevels.length - 1; i++) {
             _audioLevels[i] = _audioLevels[i + 1];
           }
@@ -209,12 +221,14 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
   // 开始录音
   void _startSpeaking() {
     if (!_isSpeaking) {
+      // 暂停 VAD 检测，避免检测到自己的音频
+      _vadAutoWake.pause();
+
       setState(() {
         _isSpeaking = true;
       });
 
       try {
-        // 开始录音并订阅音频流
         _xiaozhiService
             .startListeningCall()
             .then((_) {
@@ -228,7 +242,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
             })
             .catchError((e) {
               print('开始录音失败: $e');
-              // 如果失败，恢复状态
               if (mounted) {
                 setState(() {
                   _isSpeaking = false;
@@ -243,7 +256,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
             });
       } catch (e) {
         print('开始录音失败: $e');
-        // 如果失败，恢复状态
         setState(() {
           _isSpeaking = false;
         });
@@ -261,7 +273,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
 
   // 发送打断消息
   void _sendAbortMessage() {
-    // 发送打断消息
     _xiaozhiService.sendAbortMessage();
 
     if (mounted) {
@@ -282,7 +293,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
 
   @override
   Widget build(BuildContext context) {
-    // 确保状态栏设置正确
     SystemChrome.setSystemUIOverlayStyle(
       const SystemUiOverlayStyle(
         statusBarColor: Colors.transparent,
@@ -315,7 +325,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
           child: IconButton(
             icon: const Icon(Icons.arrow_back, color: Colors.white, size: 24),
             onPressed: () {
-              // 返回前停止播放
               _xiaozhiService.stopPlayback();
               Navigator.pop(context);
             },
@@ -397,7 +406,7 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
                 ),
                 const SizedBox(height: 8),
 
-                // 状态显示 - 使用拟物化样式
+                // 状态显示
                 Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 16,
@@ -459,6 +468,19 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
                 ),
                 const SizedBox(height: 40),
 
+                // VAD 状态显示
+                if (_vadEnabled)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      'VAD 自动唤醒: ${_vadAutoWake.isListening ? "监听中" : "未启动"}',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.6),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+
                 // 音频可视化
                 _buildAudioVisualizer(),
                 const SizedBox(height: 60),
@@ -474,7 +496,7 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
                       _buildEndCallButton(),
                       const SizedBox(width: 40),
                       _buildControlButton(
-                        icon: Icons.pan_tool, // 改为手掌图标表示打断
+                        icon: Icons.pan_tool,
                         color: Colors.white,
                         backgroundColor: Colors.orange,
                         onPressed: _sendAbortMessage,
@@ -529,7 +551,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
 
   Color _getBarColor(int index, double level) {
     if (_isSpeaking) {
-      // 渐变从蓝色到绿色
       double position = index / _audioLevels.length;
       return Color.lerp(
         Colors.blue.shade400,
@@ -537,7 +558,6 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
         position,
       )!.withOpacity(0.7 + 0.3 * level);
     } else {
-      // 非说话状态时使用柔和的蓝色
       return Colors.blue.shade200.withOpacity(0.3 + 0.4 * level);
     }
   }
@@ -584,9 +604,7 @@ class _VoiceCallScreenState extends State<VoiceCallScreen>
   Widget _buildEndCallButton() {
     return GestureDetector(
       onTap: () async {
-        // 先发送打断消息
         await _xiaozhiService.sendAbortMessage();
-        // 然后返回上一级页面
         Navigator.pop(context);
       },
       child: Container(
